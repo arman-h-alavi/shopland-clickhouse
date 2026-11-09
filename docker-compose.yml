@@ -1,0 +1,27 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: shop
+      CLICKHOUSE_USER: student
+      CLICKHOUSE_PASSWORD: student
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: shopland
+      POSTGRES_USER: student
+      POSTGRES_PASSWORD: student
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/seed.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+
+volumes:
+  clickhouse_data:
+  postgres_data:
