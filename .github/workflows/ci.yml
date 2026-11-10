@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-from-scratch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CH: docker compose exec -T clickhouse clickhouse-client --user student --password student --database shop --multiquery
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start ClickHouse, PostgreSQL and Kafka
+        run: docker compose up -d
+
+      - name: Wait for the services
+        run: |
+          wait_for() { for i in $(seq 1 60); do "$@" >/dev/null 2>&1 && return 0; sleep 2; done; echo "timeout waiting for: $*"; return 1; }
+          pg_ready() { [ "$(docker compose exec -T postgres psql -U student -d shopland -tAc 'SELECT count(*) FROM products')" = 5000 ]; }
+          wait_for docker compose exec -T clickhouse clickhouse-client --user student --password student -q "SELECT 1"
+          wait_for pg_ready
+          wait_for docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+
+      - name: Create the Kafka topic
+        run: docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic orders --partitions 3
+
+      - name: Run the SQL files in order
+        run: |
+          for f in sql/0*.sql; do
+            echo "::group::$f"
+            $CH < "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Smoke-check the warehouse
+        run: |
+          check() {
+            got=$($CH --format TSV -q "$2")
+            echo "$1: got '$got', expected '$3'"
+            [ "$got" = "$3" ]
+          }
+          check "naive table rows"             "SELECT count() FROM orders_naive" 10000000
+          check "postgres products via engine" "SELECT count() FROM products_pg" 5000
+          check "dictionary lookup"            "SELECT dictGet('shop.products_dict', 'category', toUInt64(1))" Laptop
+          check "latest statuses (FINAL)"      "SELECT count() FROM order_status_events FINAL" 500000
+          check "TTL demo rows"                "SELECT count() FROM ttl_demo" 5
+          check "top products rows"            "SELECT count() FROM top_products" 10
+          check "daily_sales matches orders"   "SELECT (SELECT sum(orders) FROM daily_sales) = (SELECT count() FROM orders WHERE status = 'delivered')" 1
+          check "customer table matches"       "SELECT (SELECT count() FROM orders_by_customer) = (SELECT count() FROM orders)" 1
+
+      - name: Kafka round trip
+        run: |
+          wait_for() { for i in $(seq 1 90); do "$@" >/dev/null 2>&1 && return 0; sleep 2; done; echo "timeout waiting for: $*"; return 1; }
+          count_is() { [ "$($CH --format TSV -q "$1")" = "$2" ]; }
+          sleep 15   # let the consumer join its group before producing
+          docker compose exec -T clickhouse clickhouse-client -u student --password student -q "
+          SELECT 20000000 + number AS order_id, rand(1) % 200000 + 1 AS customer_id, rand(2) % 5000 + 1 AS product_id,
+                 'Tehran' AS city, 'delivered' AS status, rand(5) % 5 + 1 AS quantity,
+                 (rand(6) % 2000 + 10) * 1000 AS unit_price, now() AS created_at
+          FROM numbers(1000) FORMAT JSONEachRow" \
+          | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic orders
+          echo 'this is not json' | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic orders
+          wait_for count_is "SELECT count() FROM orders WHERE order_id >= 20000000" 1000
+          wait_for count_is "SELECT count() FROM orders_queue_errors" 1
+          wait_for count_is "SELECT sum(orders) FROM daily_sales WHERE day > '2025-12-31'" 1000
+          echo "Kafka round trip OK"
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
